@@ -53,6 +53,7 @@ def initialize_database():
             expiration_time TIMESTAMP NOT NULL,
             download_count INT DEFAULT 0,
             max_downloads INT NOT NULL DEFAULT 0,
+            is_public BOOLEAN DEFAULT FALSE,
             FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
         )
     ''')

@@ -6,6 +6,8 @@ import hashlib
 import json
 from datetime import datetime, timedelta
 import time
+from cryptography.fernet import Fernet
+import os
 
 SERVER_HOST = '127.0.0.1'
 SERVER_PORT = 65432
@@ -18,6 +20,104 @@ db_config = {
     'host': 'localhost',
     'database': 'secure_file_sharing'
 }
+
+KEY_FILE = "fernet_key.key"
+
+def initialize_fernet_key():
+    """Initialize the Fernet key, generating it only if the server is running for the first time."""
+    if os.path.exists(KEY_FILE):
+        # The server is restarting
+        print("Key file exists. Server is restarting.")
+        with open(KEY_FILE, "rb") as key_file:
+            key = key_file.read()
+        print("Fernet key loaded successfully!")
+    else:
+        # The server is running for the first time
+        print("Key file not found. Server is running for the first time.")
+        key = Fernet.generate_key()
+        with open(KEY_FILE, "wb") as key_file:
+            key_file.write(key)
+        print("Fernet key generated and saved successfully!")
+
+    return Fernet(key)
+
+fernet = initialize_fernet_key()
+
+
+def list_public_files():
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT file_identifier, filename, upload_timestamp, expiration_time 
+            FROM files 
+            WHERE is_public = TRUE AND expiration_time > NOW()
+        """)
+        files = cursor.fetchall()
+        for file in files:
+            file['upload_timestamp'] = file['upload_timestamp'].isoformat()
+            file['expiration_time'] = file['expiration_time'].isoformat()
+        return json.dumps(files)
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch public files: {e}")
+        return json.dumps([])
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_public_file_from_db(file_identifier):
+    """Retrieve the encrypted file, IV, and tag for a public file identifier."""
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor(buffered=True)
+    try:
+        # Execute the query to fetch public file details
+        cursor.execute("""
+            SELECT f.encrypted_data, f.iv, f.tag, f.filename, f.download_count, f.max_downloads
+            FROM files f
+            WHERE f.file_identifier = %s AND f.is_public = 1 AND f.expiration_time > NOW();
+        """, (file_identifier,))
+        
+        result = cursor.fetchone()
+
+        if not result:
+            # File not found or expired
+            print(f"No file found or expired for identifier: {file_identifier}")
+            return None, None, None, None
+
+        # Unpack results
+        server_encrypted_data, iv, tag, filename, download_count, max_downloads = result
+
+        # Decrypt the encrypted data
+        try:
+            encrypted_data = fernet.decrypt(server_encrypted_data)
+            print("Decryption successful")
+        except Exception as decrypt_error:
+            print(f"[ERROR] Decryption failed: {decrypt_error}")
+            return None, None, None, None
+
+        # Check max_downloads and download_count
+        if max_downloads == 0 or download_count < max_downloads:
+            # Update download count
+            cursor.execute(
+                "UPDATE files SET download_count = download_count + 1 WHERE file_identifier = %s",
+                (file_identifier,)
+            )
+            conn.commit()
+            print(f"Updated download count for file: {file_identifier}")
+            return encrypted_data, iv, tag, filename
+        else:
+            # Download limit reached
+            print(f"[DEBUG] Download limit reached for public file: {file_identifier}")
+            return None, None, None, None
+    except Exception as e:
+        print(f"[ERROR] Error in get_public_file_from_db: {e}")
+        return None, None, None, None
+    finally:
+        cursor.close()
+        conn.close()
+
+
 
 def add_user_to_db(username, hashed_password, public_key):
     """Add a new user along with their public key."""
@@ -34,7 +134,7 @@ def add_user_to_db(username, hashed_password, public_key):
         conn.close()
     return True
 
-def save_file_to_db(file_identifier, filename, encrypted_data, iv, tag, owner_id, expiration_minutes, max_downloads):
+def save_file_to_db(file_identifier, filename, encrypted_data, iv, tag, owner_id, expiration_minutes, max_downloads, is_public):
     """Store encrypted file data, IV, and authentication tag in the database."""
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
@@ -48,15 +148,17 @@ def save_file_to_db(file_identifier, filename, encrypted_data, iv, tag, owner_id
         if existing_file:
             print(f"[DEBUG] Duplicate file detected: {file_identifier} for user_id {owner_id}")
             return None, True  # File already exists
+        
+        server_encrypted_data = fernet.encrypt(encrypted_data)
 
         # Calculate expiration time and insert the new file record
         expiration_time = datetime.now() + timedelta(minutes=expiration_minutes)
         cursor.execute(
             """
-            INSERT INTO files (file_identifier, filename, encrypted_data, iv, tag, owner_id, expiration_time, max_downloads, download_count)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO files (file_identifier, filename, encrypted_data, iv, tag, owner_id, expiration_time, max_downloads, download_count, is_public)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (file_identifier, filename, encrypted_data, iv, tag, owner_id, expiration_time, max_downloads, 0)
+            (file_identifier, filename, server_encrypted_data, iv, tag, owner_id, expiration_time, max_downloads, 0, is_public)
         )
         conn.commit()
         print(f"[DEBUG] File inserted: {file_identifier}")
@@ -138,7 +240,9 @@ def get_file_from_db(file_identifier, user_id):
             return None, None, None, None
 
         # Unpack results
-        encrypted_data, iv, tag, filename, download_count, max_downloads = result
+        server_encrypted_data, iv, tag, filename, download_count, max_downloads = result
+        encrypted_data = fernet.decrypt(server_encrypted_data)
+
 
         # Check max_downloads and download_count
         if max_downloads == 0 or download_count < max_downloads:
@@ -243,6 +347,37 @@ def handle_client(client_socket, client_address):
                 client_socket.send("Sign-up successful! You can now log in with your credentials.".encode())
             else:
                 client_socket.send("Username already taken. Please try a different one.".encode())
+
+        elif choice == "anonymous":
+            client_socket.send("Logged in as anonymous. You can only access public files.".encode())
+            print(f"{client_address} logged in as anonymous.")
+            while True:
+                action = client_socket.recv(1024).decode(errors='ignore')
+                if action == "list-public":
+                    response = list_public_files()
+                    client_socket.sendall(response.encode())
+                elif action == "download":
+                    file_identifier = client_socket.recv(1024).decode(errors='ignore')
+                    encrypted_data, iv, tag, filename = get_public_file_from_db(file_identifier)
+                    if encrypted_data:
+                        client_socket.send(b"START")
+                        client_socket.send(iv)
+                        time.sleep(0.1)
+                        client_socket.send(tag)
+                        time.sleep(0.1)
+                        client_socket.send(filename.encode())
+                        time.sleep(0.1)
+                        for i in range(0, len(encrypted_data), 1048576):
+                            client_socket.send(encrypted_data[i:i + 1048576])
+                        client_socket.send(b"EOF")
+                    else:
+                        client_socket.send("[ERROR] File not found or expired.".encode())
+
+                elif action == "exit":
+                    break
+
+
+        
         elif choice == "login":
             username = client_socket.recv(1024).decode(errors='ignore')
             password = client_socket.recv(1024).decode(errors='ignore')
@@ -266,7 +401,8 @@ def handle_client(client_socket, client_address):
                                 encrypted_data += chunk[:chunk.index(b"EOF")]
                                 break
                             encrypted_data += chunk
-                        file_id, is_duplicate = save_file_to_db(file_identifier, filename, encrypted_data, iv, tag, user_id, expiration_minutes, max_downloads)
+                        is_public = client_socket.recv(1024).decode(errors='ignore') == "true"
+                        file_id, is_duplicate = save_file_to_db(file_identifier, filename, encrypted_data, iv, tag, user_id, expiration_minutes, max_downloads, is_public)
                         if is_duplicate:
                             client_socket.send(f"[ERROR] File '{filename}' already exists in the database. Identifier: {file_identifier}".encode())
                         else:
@@ -277,11 +413,11 @@ def handle_client(client_socket, client_address):
                         if encrypted_data:
                             client_socket.send(b"START")
                             client_socket.send(iv)
-                            time.sleep(0.5)
+                            time.sleep(0.1)
                             client_socket.send(tag)
-                            time.sleep(0.5)
+                            time.sleep(0.1)
                             client_socket.send(filename.encode())
-                            time.sleep(0.5)
+                            time.sleep(0.1)
                             for i in range(0, len(encrypted_data), 1048576):
                                 client_socket.send(encrypted_data[i:i + 1048576])
                             client_socket.send(b"EOF")
@@ -346,15 +482,16 @@ def handle_client(client_socket, client_address):
         """, (file_id, user_id))
                             result = cursor.fetchone()
                             if result:
-                                encrypted_data, iv, tag, filename, encrypted_key = result
+                                server_encrypted_data, iv, tag, filename, encrypted_key = result
+                                encrypted_data = fernet.decrypt(server_encrypted_data)
                                 print(f"[DEBUG] Encrypted key from DB: {encrypted_key} (Length: {len(encrypted_key)})")
                                 client_socket.send(encrypted_key)
                                 client_socket.send(iv)
-                                time.sleep(0.5)
+                                time.sleep(0.1)
                                 client_socket.send(tag)  # Send authentication tag
-                                time.sleep(0.5)
+                                time.sleep(0.1)
                                 client_socket.send(filename.encode())  # Send filename
-                                time.sleep(0.5)
+                                time.sleep(0.1)
                                 for i in range(0, len(encrypted_data), 1048576):
                                     client_socket.send(encrypted_data[i:i + 1048576])
                                 client_socket.send(b"EOF")

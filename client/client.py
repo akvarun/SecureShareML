@@ -62,7 +62,7 @@ def connect_to_server():
     client_socket.connect((SERVER_HOST, SERVER_PORT))
     return client_socket
 
-def send_file(client_socket, filepath, expiration_minutes, max_downloads):
+def send_file(client_socket, filepath, expiration_minutes, max_downloads, is_public):
     try:
         filename = os.path.basename(filepath)
 
@@ -82,23 +82,25 @@ def send_file(client_socket, filepath, expiration_minutes, max_downloads):
 
         # Send metadata
         client_socket.send(filename.encode())
-        time.sleep(0.5)
+        time.sleep(0.1)
         client_socket.send(str(expiration_minutes).encode())
-        time.sleep(0.5)
+        time.sleep(0.1)
         client_socket.send(str(max_downloads).encode())
-        time.sleep(0.5)
+        time.sleep(0.1)
         client_socket.send(file_identifier.encode())  # Send file identifier
-        time.sleep(0.5)
+        time.sleep(0.1)
 
         # Send encryption details and encrypted file
         client_socket.send(iv)  # Send IV
-        time.sleep(0.5)
+        time.sleep(0.1)
         client_socket.send(tag)  # Send the authentication tag
-        time.sleep(0.5)
+        time.sleep(0.1)
         for i in range(0, len(ciphertext), 1048576):
             client_socket.send(ciphertext[i:i + 1048576])
-        time.sleep(0.5)
+        time.sleep(0.1)
         client_socket.send(b'EOF')
+        time.sleep(0.1)
+        client_socket.send("true".encode() if is_public else "false".encode())
 
         # Get upload response
         upload_response = client_socket.recv(1024).decode(errors='ignore')
@@ -154,7 +156,7 @@ def receive_file(client_socket, file_identifier):
 
 def main():
     while True:
-        choice = input("Do you want to log in, sign up, or exit? (login/signup/exit): ").lower()
+        choice = input("Do you want to log in, sign up, Anonymous or exit? (login/signup/Anonymous/exit): ").lower()
 
         if choice == "exit":
             break
@@ -163,7 +165,7 @@ def main():
 
         if choice == "signup":
             client_socket.send("signup".encode())
-            time.sleep(0.5)
+            time.sleep(0.1)
             username = input("Enter your username: ")
             password = input("Enter your password: ")
             hashed_password = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
@@ -171,16 +173,48 @@ def main():
             public_key = generate_key_pair(username)
             print("[DEBUG] Sending signup data to server.")  # Generate RSA key pair
             client_socket.send(username.encode())
-            time.sleep(0.5)
+            time.sleep(0.1)
             client_socket.send(hashed_password)
-            time.sleep(0.5)
+            time.sleep(0.1)
             client_socket.send(public_key)
-            time.sleep(0.5)
+            time.sleep(0.1)
             print("[DEBUG] Signup data sent.")  # Send public key to server
 
             response = client_socket.recv(1024).decode(errors='ignore')
             print(response)
             client_socket.close()
+
+        elif choice == "anonymous":
+            client_socket.send("anonymous".encode())
+            response = client_socket.recv(1024).decode(errors='ignore')
+            print(response)
+            while True:
+                action = input("Choose an action (list-public/download/exit): ").lower()
+                client_socket.send(action.encode())
+                if action == "list-public":
+                    response = client_socket.recv(4096).decode(errors='ignore')
+                    try:
+                        files = json.loads(response)
+                        if not files:
+                            print("No public files found.")
+                        else:
+                            for file in files:
+                                print("\nPublic File Details:")
+                                for key, value in file.items():
+                                    print(f"{key}: {value}")
+
+                    except json.JSONDecodeError:
+                        print(response)
+                    
+                elif action == "download":
+                    file_identifier = input("Enter the file identifier to download: ")
+                    receive_file(client_socket, file_identifier)
+                
+                elif action == "exit":
+                    break
+
+
+                
 
         elif choice == "login":
             client_socket.send("login".encode())
@@ -213,14 +247,15 @@ def main():
 
                         expiration_minutes = int(input("Enter expiration time in minutes: "))
                         max_downloads = int(input("Enter maximum number of downloads (0 for unlimited): "))
-                        send_file(client_socket, filepath, expiration_minutes, max_downloads)
+                        is_public = input("Make this file public? (yes/no): ").strip().lower() == "yes"
+                        send_file(client_socket, filepath, expiration_minutes, max_downloads, is_public)
 
                     elif action == "download":
                         file_identifier = input("Enter the file identifier to download: ")
                         receive_file(client_socket, file_identifier)
 
                     elif action == "list-uploaded" or action == "list-shared":
-                        time.sleep(0.5)
+                        time.sleep(0.1)
                         response = client_socket.recv(4096).decode(errors='ignore')
                         try:
                             files = json.loads(response)
@@ -238,9 +273,9 @@ def main():
                         recipient = input("Enter recipient's username: ")
                         file_id = input("Enter file identifier: ")
                         client_socket.send(recipient.encode())  # Send recipient username
-                        time.sleep(0.5)
+                        time.sleep(0.1)
                         client_socket.send(file_id.encode())  # Send file identifier
-                        time.sleep(0.5)            
+                        time.sleep(0.1)            
                         key_file = f"{file_id}_key.txt"
                         try:
                             with open(key_file, "r") as f:
