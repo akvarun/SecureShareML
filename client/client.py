@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
-from test import testpdf
+from testpdf import testpdf
 
 SERVER_HOST = '127.0.0.1'
 SERVER_PORT = 65432
@@ -67,13 +67,13 @@ def send_file(client_socket, filepath, expiration_minutes, max_downloads, is_pub
     try:
         filename = os.path.basename(filepath)
 
+        #test for malicious file
         ismal=testpdf(filepath)
         if(ismal[0]!='no'):
             print("Malicious file detected")
             return
         else:
             print('success')
-
 
         # Compute file identifier (based on plaintext file data)
         with open(filepath, 'rb') as f:

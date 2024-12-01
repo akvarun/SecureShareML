@@ -1,2 +1,7 @@
 path/
 .DS_Store
+*.pem 
+*.key
+*.txt
+__pycache__/
+*.pdf 
